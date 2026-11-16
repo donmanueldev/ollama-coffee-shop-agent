@@ -15,8 +15,8 @@ class OrderLine:
     quantity: int
 
     @property
-    def total_mxn(self) -> Decimal:
-        return self.product.price_mxn * self.quantity
+    def total_nio(self) -> Decimal:
+        return self.product.price_nio * self.quantity
 
 
 @dataclass
@@ -25,18 +25,18 @@ class Order:
     lines: dict[str, OrderLine] = field(default_factory=dict)
     shipping: ShippingQuote | None = None
     customer_name: str | None = None
-    customer_email: str | None = None
+    customer_phone: str | None = None
+    payment_reference: str | None = None
     payment_url: str | None = None
-    checkout_session_id: str | None = None
 
     @property
-    def subtotal_mxn(self) -> Decimal:
-        return sum((line.total_mxn for line in self.lines.values()), Decimal("0.00"))
+    def subtotal_nio(self) -> Decimal:
+        return sum((line.total_nio for line in self.lines.values()), Decimal("0.00"))
 
     @property
-    def total_mxn(self) -> Decimal:
-        shipping = self.shipping.cost_mxn if self.shipping else Decimal("0.00")
-        return self.subtotal_mxn + shipping
+    def total_nio(self) -> Decimal:
+        shipping = self.shipping.cost_nio if self.shipping else Decimal("0.00")
+        return self.subtotal_nio + shipping
 
     @property
     def status(self) -> str:
@@ -76,6 +76,14 @@ class Order:
         self._ensure_editable()
         self.shipping = quote
 
+    def ensure_ready_for_payment(self) -> None:
+        if not self.lines:
+            raise OrderError("El pedido está vacío.")
+        if self.shipping is None:
+            raise OrderError("Falta cotizar el envío antes de generar el link de pago.")
+        if not self.customer_phone:
+            raise OrderError("Falta el número de teléfono Pocket del cliente.")
+
     def _product(self, sku: str) -> Product:
         product = self.catalog.get(sku)
         if product is None:
@@ -93,22 +101,24 @@ class Order:
     def to_dict(self) -> dict:
         return {
             "estado": self.status,
-            "cliente": {"nombre": self.customer_name, "email": self.customer_email},
+            "moneda": "NIO",
+            "cliente": {"nombre": self.customer_name, "telefono": self.customer_phone},
             "productos": [
                 {
                     "sku": line.product.sku,
                     "producto": line.product.name,
                     "cantidad": line.quantity,
-                    "precio_unitario_mxn": float(line.product.price_mxn),
-                    "total_mxn": float(line.total_mxn),
+                    "precio_unitario_nio": float(line.product.price_nio),
+                    "total_nio": float(line.total_nio),
                 }
                 for line in self.lines.values()
             ],
-            "subtotal_mxn": float(self.subtotal_mxn),
+            "subtotal_nio": float(self.subtotal_nio),
             "envio": self.shipping.to_dict() if self.shipping else None,
-            "total_mxn": float(self.total_mxn),
+            "total_nio": float(self.total_nio),
             "pago": {
+                "metodo": "Pocket (simulado)",
+                "referencia": self.payment_reference,
                 "link": self.payment_url,
-                "stripe_checkout_session_id": self.checkout_session_id,
             },
         }

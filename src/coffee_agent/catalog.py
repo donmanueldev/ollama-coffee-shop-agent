@@ -1,8 +1,9 @@
 import csv
-import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+
+from coffee_agent.text import normalize
 
 
 @dataclass(frozen=True)
@@ -10,7 +11,7 @@ class Product:
     sku: str
     name: str
     description: str
-    price_mxn: Decimal
+    price_nio: Decimal
     stock: int
 
     def to_dict(self) -> dict:
@@ -18,15 +19,9 @@ class Product:
             "sku": self.sku,
             "producto": self.name,
             "descripcion": self.description,
-            "precio_mxn": float(self.price_mxn),
+            "precio_nio": float(self.price_nio),
             "stock": self.stock,
         }
-
-
-def _normalize(text: str) -> str:
-    # Customers type "cafe" or "molino" without accents; match them anyway.
-    decomposed = unicodedata.normalize("NFKD", text.casefold())
-    return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
 class Catalog:
@@ -41,7 +36,7 @@ class Catalog:
                     sku=row["sku"].strip(),
                     name=row["producto"].strip(),
                     description=row["descripcion"].strip(),
-                    price_mxn=Decimal(row["precio_mxn"]),
+                    price_nio=Decimal(row["precio_nio"]),
                     stock=int(row["stock"]),
                 )
                 for row in csv.DictReader(f)
@@ -56,9 +51,9 @@ class Catalog:
 
     def search(self, query: str) -> list[Product]:
         """Products whose sku, name, or description contain every word of the query."""
-        words = _normalize(query).split()
+        words = normalize(query).split()
         if not words:
             return self.all()
         return [
-            p for p in self._by_sku.values() if all(w in _normalize(f"{p.sku} {p.name} {p.description}") for w in words)
+            p for p in self._by_sku.values() if all(w in normalize(f"{p.sku} {p.name} {p.description}") for w in words)
         ]

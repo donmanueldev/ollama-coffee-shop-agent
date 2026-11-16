@@ -1,177 +1,134 @@
 import json
 import re
 from collections.abc import Callable
-from typing import Any, Protocol
+
+import anthropic
+from anthropic.types import MessageParam, TextBlock, ToolParam, ToolResultBlockParam, ToolUseBlock
 
 from coffee_agent.catalog import Catalog
 from coffee_agent.order import Order, OrderError
-from coffee_agent.payments import PaymentError
-from coffee_agent.shipping import InvalidPostalCode, quote_shipping
+from coffee_agent.shipping import InvalidDepartment, departments, quote_shipping
+from coffee_agent.text import cordobas
 
 SYSTEM_PROMPT = """\
-Eres Barista, el asistente de ventas de una cafetería online mexicana. Hablas en español, \
-con un tono cálido y breve. Precios en pesos mexicanos (MXN).
+Eres Barista, el asistente de ventas de una cafetería online en Nicaragua. Atiendes por chat, en \
+español, con un tono cálido y breve. La moneda es el córdoba nicaragüense; escribe los montos \
+como C$ 147.00.
 
-Reglas:
-- No conoces el catálogo de memoria. Antes de mencionar cualquier producto, precio, existencia \
-o costo de envío DEBES llamar a la herramienta correspondiente. Nunca inventes datos.
-- Para agregar o quitar productos usa el SKU exacto que devuelve buscar_productos; si no lo \
-tienes, busca primero.
-- Si una herramienta devuelve un error, explícaselo al cliente con tus palabras y ofrece una \
-alternativa.
-- Para cerrar la venta: 1) pide el código postal y cotiza el envío, 2) muestra el resumen \
-(productos, subtotal, envío y total) y pide confirmación, 3) pide nombre y email, \
-4) genera el link de pago y compártelo completo.
-- Cuando el cliente pida un producto, llama agregar_producto de inmediato con su SKU. Cuando dé \
-su código postal, llama cotizar_envio.
-- El envío es gratis a partir de $800 de subtotal.
-- Si el cliente cambia el pedido después de cotizar, vuelve a cotizar el envío.
+Los precios, el stock, el envío y el cobro los calcula el sistema a través de tus herramientas: \
+usa sus resultados y no estimes montos por tu cuenta. Agrega o quita productos con su SKU en \
+cuanto el cliente lo pida. Si una herramienta devuelve un error, explícale al cliente qué pasó y \
+ofrécele una alternativa.
 
-Catálogo (SKU | producto | descripción | precio MXN | stock):
+Para cerrar la venta:
+1. Pregunta a qué departamento se envía y cotiza el envío (es gratis desde C$ 1,600 de \
+subtotal). Si el pedido cambia después, vuelve a cotizarlo.
+2. Muestra el resumen: productos, subtotal, envío y total.
+3. Pide el nombre del cliente y el teléfono de su cuenta Pocket.
+4. Llama generar_link_de_pago. El sistema le muestra el resumen al cliente para que lo confirme \
+antes de cobrar. Si lo confirma, comparte el link completo; si no, pregúntale qué quiere cambiar.
+
+Catálogo (SKU | producto | descripción | precio | stock):
 {catalog}
 """
 
-TOOLS: list[dict] = [
+TOOLS: list[ToolParam] = [
     {
-        "type": "function",
-        "function": {
-            "name": "buscar_productos",
-            "description": "Busca en el catálogo por palabras (nombre, descripción o SKU). "
-            "Sin consulta devuelve el catálogo completo.",
-            "parameters": {
-                "type": "object",
-                "properties": {"consulta": {"type": "string", "description": "Ej. 'molido', 'prensa', 'Veracruz'"}},
-            },
+        "name": "buscar_productos",
+        "description": "Busca en el catálogo por palabras (nombre, descripción o SKU). "
+        "Sin consulta devuelve el catálogo completo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"consulta": {"type": "string", "description": "Ej. 'molido', 'prensa', 'Jinotega'"}},
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "agregar_producto",
-            "description": "Agrega unidades de un producto al pedido.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sku": {"type": "string", "description": "SKU del producto, ej. CAF-001"},
-                    "cantidad": {"type": "integer", "description": "Unidades a agregar"},
-                },
-                "required": ["sku", "cantidad"],
+        "name": "agregar_producto",
+        "description": "Agrega unidades de un producto al pedido.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string", "description": "SKU del producto, ej. CAF-001"},
+                "cantidad": {"type": "integer", "description": "Unidades a agregar"},
             },
+            "required": ["sku", "cantidad"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "quitar_producto",
-            "description": "Quita unidades de un producto del pedido. Sin cantidad quita la línea completa.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sku": {"type": "string"},
-                    "cantidad": {"type": "integer"},
-                },
-                "required": ["sku"],
-            },
+        "name": "quitar_producto",
+        "description": "Quita unidades de un producto del pedido. Sin cantidad quita la línea completa.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"sku": {"type": "string"}, "cantidad": {"type": "integer"}},
+            "required": ["sku"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "ver_pedido",
-            "description": "Devuelve el pedido actual con subtotal, envío y total.",
-            "parameters": {"type": "object", "properties": {}},
+        "name": "ver_pedido",
+        "description": "Devuelve el pedido actual con subtotal, envío y total.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cotizar_envio",
+        "description": "Cotiza el envío del pedido actual a un departamento de Nicaragua.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"departamento": {"type": "string", "description": ", ".join(departments())}},
+            "required": ["departamento"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "cotizar_envio",
-            "description": "Cotiza el envío del pedido actual a un código postal de México.",
-            "parameters": {
-                "type": "object",
-                "properties": {"codigo_postal": {"type": "string", "description": "5 dígitos"}},
-                "required": ["codigo_postal"],
+        "name": "generar_link_de_pago",
+        "description": "Cierra la venta con un cobro Pocket. Antes de cobrar, el sistema le pide al cliente "
+        "que confirme el resumen; devuelve el link de pago o el motivo por el que no se generó.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre": {"type": "string", "description": "Nombre del cliente"},
+                "telefono": {"type": "string", "description": "Teléfono de su cuenta Pocket, 8 dígitos"},
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generar_link_de_pago",
-            "description": "Cierra la venta: genera el link de pago de Stripe. Úsala solo después de "
-            "cotizar el envío y de que el cliente confirme el resumen.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "nombre": {"type": "string", "description": "Nombre del cliente"},
-                    "email": {"type": "string", "description": "Email del cliente"},
-                },
-                "required": ["nombre", "email"],
-            },
+            "required": ["nombre", "telefono"],
         },
     },
 ]
 
-_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-# A bracketed "[Enlace de pago]" or a markdown link, written when no link exists yet.
-_INVENTED_LINK = re.compile(r"\[[^\]]*(enlace|link)[^\]]*\]|\]\(https?://", re.IGNORECASE)
-_INVENTED_LINK_CORRECTION = (
-    "Nota del sistema: todavía no existe un link de pago y no debes inventarlo. Si el cliente ya "
-    "confirmó y dio nombre y email, llama generar_link_de_pago; si no, pídele lo que falte."
-)
-_TOOL_NAMES = {tool["function"]["name"] for tool in TOOLS}
+# Nicaraguan mobile numbers: 8 digits starting with 5, 7 or 8, optionally prefixed with 505.
+_PHONE = re.compile(r"(?:505)?([578]\d{7})")
 
 
 def build_system_prompt(catalog: Catalog) -> str:
-    # The catalog is small, so the model sees it up front; without it small models invent products.
-    listing = "\n".join(f"- {p.sku} | {p.name} | {p.description} | {p.price_mxn} | {p.stock}" for p in catalog.all())
+    # The catalog is small and stable, so it rides in the cached prompt instead of costing a tool call.
+    listing = "\n".join(
+        f"- {p.sku} | {p.name} | {p.description} | {cordobas(p.price_nio)} | {p.stock}" for p in catalog.all()
+    )
     return SYSTEM_PROMPT.format(catalog=listing)
 
 
-def parse_text_tool_calls(content: str) -> list[tuple[str, dict]]:
-    """Find tool calls a model wrote as plain JSON text, e.g. {"name": ..., "arguments": {...}}.
-
-    Some local models (qwen2.5-coder among them) emit calls this way instead of using the
-    native tool-call format, so Ollama returns them as ordinary content.
-    """
-    decoder = json.JSONDecoder()
-    calls = []
-    index = content.find("{")
-    while index != -1:
-        try:
-            value, end = decoder.raw_decode(content, index)
-        except json.JSONDecodeError:
-            index = content.find("{", index + 1)
-            continue
-        if isinstance(value, dict) and value.get("name") in _TOOL_NAMES:
-            arguments = value.get("arguments") or value.get("parameters") or {}
-            calls.append((value["name"], arguments if isinstance(arguments, dict) else {}))
-        index = content.find("{", end)
-    return calls
-
-
-class ChatClient(Protocol):
-    def chat(self, *, model: str, messages: list, tools: list, options: dict) -> Any: ...
-
-
 class OrderTools:
-    """Executes the model's tool calls against the order. Returns JSON strings for the model."""
+    """Executes the model's tool calls against the order."""
 
-    def __init__(self, order: Order, create_payment_link: Callable[[Order], None]):
+    def __init__(
+        self,
+        order: Order,
+        create_payment_link: Callable[[Order], None],
+        customer_confirms: Callable[[Order], bool],
+    ):
         self.order = order
         self._create_payment_link = create_payment_link
+        # The customer confirms through the app, not through the model, so a misread "sí" can't charge.
+        self._customer_confirms = customer_confirms
 
-    def run(self, name: str, arguments: dict) -> str:
+    def run(self, name: str, arguments: dict) -> tuple[dict, bool]:
+        """Return the tool's result and whether it is an error the model should explain."""
         handler = getattr(self, f"_tool_{name}", None)
         if handler is None:
-            return json.dumps({"error": f"Herramienta desconocida: {name}"})
+            return {"error": f"Herramienta desconocida: {name}"}, True
         try:
-            result = handler(**arguments)
-        except (OrderError, InvalidPostalCode, PaymentError) as e:
-            result = {"error": str(e)}
+            return handler(**arguments), False
+        except (OrderError, InvalidDepartment) as e:
+            return {"error": str(e)}, True
         except (TypeError, ValueError):
-            result = {"error": f"Argumentos inválidos para {name}: {arguments}"}
-        return json.dumps(result, ensure_ascii=False)
+            return {"error": f"Argumentos inválidos para {name}: {arguments}"}, True
 
     def _tool_buscar_productos(self, consulta: str = "") -> dict:
         products = self.order.catalog.search(consulta)
@@ -188,67 +145,79 @@ class OrderTools:
     def _tool_ver_pedido(self) -> dict:
         return {"pedido": self.order.to_dict()}
 
-    def _tool_cotizar_envio(self, codigo_postal: str | int) -> dict:
+    def _tool_cotizar_envio(self, departamento: str) -> dict:
         if not self.order.lines:
             raise OrderError("Agrega productos antes de cotizar el envío.")
-        quote = quote_shipping(str(codigo_postal).zfill(5), self.order.subtotal_mxn)
+        quote = quote_shipping(departamento, self.order.subtotal_nio)
         self.order.set_shipping(quote)
-        return {"envio": quote.to_dict(), "total_mxn": float(self.order.total_mxn)}
+        return {"envio": quote.to_dict(), "total_nio": float(self.order.total_nio)}
 
-    def _tool_generar_link_de_pago(self, nombre: str, email: str) -> dict:
+    def _tool_generar_link_de_pago(self, nombre: str, telefono: str | int) -> dict:
         if self.order.payment_url:
             return {"link_de_pago": self.order.payment_url, "nota": "El link ya se había generado."}
-        email = email.strip()
-        if not _EMAIL.fullmatch(email):
-            raise OrderError(f"'{email}' no parece un email válido.")
+        match = _PHONE.fullmatch(re.sub(r"[\s\-+()]", "", str(telefono)))
+        if not match:
+            raise OrderError(f"'{telefono}' no parece un número móvil de Nicaragua (8 dígitos).")
         self.order.customer_name = nombre.strip()
-        self.order.customer_email = email
+        self.order.customer_phone = f"+505{match.group(1)}"
+        self.order.ensure_ready_for_payment()
+        if not self._customer_confirms(self.order):
+            raise OrderError("El cliente no confirmó el resumen. Pregúntale qué quiere cambiar.")
         self._create_payment_link(self.order)
-        return {"link_de_pago": self.order.payment_url, "total_mxn": float(self.order.total_mxn)}
+        return {
+            "link_de_pago": self.order.payment_url,
+            "referencia": self.order.payment_reference,
+            "total_nio": float(self.order.total_nio),
+        }
 
 
 class CoffeeShopAgent:
-    # Small local models sometimes loop on tool calls; cap the rounds per customer message.
+    # A runaway sequence of tool calls should end the turn, not spin forever.
     MAX_TOOL_ROUNDS = 8
+    # Chat replies with short tool hops; low effort keeps latency and cost down. Re-check with the evals.
+    EFFORT = "low"
+    REFUSAL_REPLY = "Perdón, no puedo ayudarte con eso. ¿Te ayudo con tu pedido de café?"
 
-    # Deterministic output makes small models follow the tool protocol more reliably.
-    OPTIONS = {"temperature": 0}
-
-    def __init__(self, client: ChatClient, model: str, tools: OrderTools):
+    def __init__(self, client: anthropic.Anthropic, model: str, tools: OrderTools):
         self._client = client
         self._model = model
         self._tools = tools
-        self.messages: list = [{"role": "system", "content": build_system_prompt(tools.order.catalog)}]
+        self._system = build_system_prompt(tools.order.catalog)
+        self.messages: list[MessageParam] = []
 
     def reply(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
-        corrected = False
         for _ in range(self.MAX_TOOL_ROUNDS):
-            response = self._client.chat(model=self._model, messages=self.messages, tools=TOOLS, options=self.OPTIONS)
-            message = response.message
-            self.messages.append(message)
-            if message.tool_calls:
-                calls = [(c.function.name, dict(c.function.arguments or {})) for c in message.tool_calls]
-            else:
-                calls = parse_text_tool_calls(message.content or "")
-            if not calls:
-                answer = message.content or ""
-                if not corrected and self._invents_payment_link(answer):
-                    corrected = True
-                    self.messages[-1] = {"role": "user", "content": _INVENTED_LINK_CORRECTION}
-                    continue
-                return self._with_payment_link(answer)
-            for name, arguments in calls:
-                result = self._tools.run(name, arguments)
-                self.messages.append({"role": "tool", "tool_name": name, "content": result})
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=16000,
+                system=self._system,
+                tools=TOOLS,
+                messages=self.messages,
+                output_config={"effort": self.EFFORT},
+                # Caches tools + system + history up to the last block, so each turn pays only for what's new.
+                cache_control={"type": "ephemeral"},
+            )
+            # Keep the full content (thinking and tool_use blocks included); the API expects it back as is.
+            self.messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason == "refusal":
+                return self.REFUSAL_REPLY
+            if response.stop_reason != "tool_use":
+                return "".join(block.text for block in response.content if isinstance(block, TextBlock))
+            self.messages.append({"role": "user", "content": self._run_tools(response.content)})
         return "Perdón, me enredé con tu solicitud. ¿Me la puedes repetir con otras palabras?"
 
-    def _with_payment_link(self, answer: str) -> str:
-        # Small models sometimes write "[link de pago]" instead of the URL; the customer must get it.
-        url = self._tools.order.payment_url
-        if url and url not in answer:
-            return f"{answer}\n\nLink de pago: {url}"
-        return answer
-
-    def _invents_payment_link(self, answer: str) -> bool:
-        return self._tools.order.payment_url is None and bool(_INVENTED_LINK.search(answer))
+    def _run_tools(self, content: list) -> list[ToolResultBlockParam]:
+        results: list[ToolResultBlockParam] = []
+        for block in content:
+            if isinstance(block, ToolUseBlock):
+                result, is_error = self._tools.run(block.name, dict(block.input))
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                        "is_error": is_error,
+                    }
+                )
+        return results

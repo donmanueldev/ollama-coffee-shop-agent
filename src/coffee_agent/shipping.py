@@ -1,45 +1,65 @@
-import re
+import csv
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import cache
+from pathlib import Path
 
-FREE_SHIPPING_FROM_MXN = Decimal("800.00")
-LOCAL_RATE_MXN = Decimal("89.00")
-NATIONAL_RATE_MXN = Decimal("149.00")
+from coffee_agent.text import normalize
 
-# Mexican postal codes 01000–16999 belong to Mexico City, where the shop ships from.
-_LOCAL_PREFIXES = range(1, 17)
+FREE_SHIPPING_FROM_NIO = Decimal("1600.00")
+RATES_PATH = Path(__file__).resolve().parents[2] / "data" / "envios.csv"
 
 
-class InvalidPostalCode(ValueError):
+class InvalidDepartment(ValueError):
     pass
 
 
 @dataclass(frozen=True)
+class ShippingRate:
+    department: str
+    cost_nio: Decimal
+    estimated_days: str
+
+
+@dataclass(frozen=True)
 class ShippingQuote:
-    postal_code: str
-    zone: str
-    cost_mxn: Decimal
+    department: str
+    cost_nio: Decimal
     estimated_days: str
 
     def to_dict(self) -> dict:
         return {
-            "codigo_postal": self.postal_code,
-            "zona": self.zone,
-            "costo_mxn": float(self.cost_mxn),
+            "departamento": self.department,
+            "costo_nio": float(self.cost_nio),
             "dias_estimados": self.estimated_days,
         }
 
 
-def quote_shipping(postal_code: str, subtotal_mxn: Decimal) -> ShippingQuote:
-    postal_code = postal_code.strip()
-    if not re.fullmatch(r"\d{5}", postal_code) or postal_code.startswith("00"):
-        raise InvalidPostalCode(f"'{postal_code}' no es un código postal mexicano válido (5 dígitos).")
+@cache
+def _rates_by_name() -> dict[str, ShippingRate]:
+    """Rates keyed by every accepted spelling: the department name and its aliases, normalized."""
+    rates: dict[str, ShippingRate] = {}
+    with RATES_PATH.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rate = ShippingRate(row["departamento"], Decimal(row["costo_nio"]), row["dias_estimados"])
+            for name in [rate.department, *filter(None, row["alias"].split("|"))]:
+                rates[normalize(name)] = rate
+    return rates
 
-    if int(postal_code[:2]) in _LOCAL_PREFIXES:
-        zone, cost, days = "local (CDMX)", LOCAL_RATE_MXN, "1-2 días hábiles"
-    else:
-        zone, cost, days = "nacional", NATIONAL_RATE_MXN, "3-5 días hábiles"
 
-    if subtotal_mxn >= FREE_SHIPPING_FROM_MXN:
-        cost = Decimal("0.00")
-    return ShippingQuote(postal_code, zone, cost, days)
+def departments() -> list[str]:
+    return sorted({rate.department for rate in _rates_by_name().values()})
+
+
+def find_rate(name: str) -> ShippingRate:
+    key = normalize(name).strip().removeprefix("departamento de ").removeprefix("region autonoma de la ")
+    rate = _rates_by_name().get(key.strip())
+    if rate is None:
+        raise InvalidDepartment(f"'{name}' no es un departamento de Nicaragua. Opciones: {', '.join(departments())}.")
+    return rate
+
+
+def quote_shipping(department_name: str, subtotal_nio: Decimal) -> ShippingQuote:
+    rate = find_rate(department_name)
+    cost = Decimal("0.00") if subtotal_nio >= FREE_SHIPPING_FROM_NIO else rate.cost_nio
+    return ShippingQuote(rate.department, cost, rate.estimated_days)

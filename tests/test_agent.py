@@ -1,32 +1,16 @@
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import stripe
+from anthropic.types import TextBlock, ToolUseBlock
 
-from coffee_agent.agent import CoffeeShopAgent, OrderTools, parse_text_tool_calls
+from coffee_agent.agent import CoffeeShopAgent, OrderTools
 from coffee_agent.catalog import Catalog
 from coffee_agent.order import Order
-from coffee_agent.payments import create_payment_link
+from coffee_agent.payments import create_pocket_charge
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "catalogo.csv"
-
-
-class FakeSessions:
-    def __init__(self, error: Exception | None = None):
-        self.params = None
-        self._error = error
-
-    def create(self, params):
-        if self._error:
-            raise self._error
-        self.params = params
-        return SimpleNamespace(id="cs_test_123", url="https://checkout.stripe.com/c/pay/cs_test_123")
-
-
-def fake_stripe(sessions: FakeSessions):
-    return SimpleNamespace(v1=SimpleNamespace(checkout=SimpleNamespace(sessions=sessions)))
+POCKET_URL = "https://pocket.example/cobro/PKT-TEST01"
 
 
 @pytest.fixture
@@ -34,161 +18,189 @@ def order() -> Order:
     return Order(Catalog.from_csv(CATALOG_PATH))
 
 
-def make_tools(order: Order, sessions: FakeSessions) -> OrderTools:
-    return OrderTools(order, lambda o: create_payment_link(fake_stripe(sessions), o, "https://x.test/ok"))
+def make_tools(order: Order, confirms: bool = True) -> OrderTools:
+    return OrderTools(order, lambda o: create_pocket_charge(o, new_reference=lambda: "PKT-TEST01"), lambda _o: confirms)
 
 
 def run(tools: OrderTools, name: str, **args) -> dict:
-    return json.loads(tools.run(name, args))
+    result, _is_error = tools.run(name, args)
+    return result
 
 
-def test_full_sale_creates_checkout_with_items_and_shipping(order):
-    sessions = FakeSessions()
-    tools = make_tools(order, sessions)
+def ready_to_pay(order: Order, confirms: bool = True) -> OrderTools:
+    tools = make_tools(order, confirms)
+    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
+    run(tools, "cotizar_envio", departamento="Managua")
+    return tools
+
+
+def test_full_sale_creates_simulated_pocket_charge(order):
+    tools = make_tools(order)
 
     run(tools, "agregar_producto", sku="CAF-001", cantidad="2")  # models often send strings
-    run(tools, "cotizar_envio", codigo_postal="44100")
-    result = run(tools, "generar_link_de_pago", nombre="Ana", email="ana@example.com")
+    run(tools, "cotizar_envio", departamento="León")
+    result = run(tools, "generar_link_de_pago", nombre="Ana", telefono="+505 8888-1234")
 
-    assert result["link_de_pago"] == "https://checkout.stripe.com/c/pay/cs_test_123"
-    item = sessions.params["line_items"][0]
-    assert item["quantity"] == 2
-    assert item["price_data"]["unit_amount"] == 14700
-    assert sessions.params["shipping_options"][0]["shipping_rate_data"]["fixed_amount"]["amount"] == 14900
-    assert sessions.params["customer_email"] == "ana@example.com"
-    assert order.to_dict()["estado"] == "pendiente_de_pago"
+    assert result == {"link_de_pago": POCKET_URL, "referencia": "PKT-TEST01", "total_nio": 444.0}
+    data = order.to_dict()
+    assert data["estado"] == "pendiente_de_pago"
+    assert data["cliente"] == {"nombre": "Ana", "telefono": "+50588881234"}
+    assert data["pago"] == {"metodo": "Pocket (simulado)", "referencia": "PKT-TEST01", "link": POCKET_URL}
+
+
+def test_default_reference_is_unique_pocket_style(order):
+    tools = OrderTools(order, create_pocket_charge, lambda _o: True)
+    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
+    run(tools, "cotizar_envio", departamento="Managua")
+
+    reference = run(tools, "generar_link_de_pago", nombre="Ana", telefono="88881234")["referencia"]
+
+    assert reference.startswith("PKT-") and len(reference) == 12
+    assert order.payment_url.endswith(reference)
 
 
 def test_payment_link_requires_shipping_quote(order):
-    sessions = FakeSessions()
-    tools = make_tools(order, sessions)
+    tools = make_tools(order)
     run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
 
-    result = run(tools, "generar_link_de_pago", nombre="Ana", email="ana@example.com")
+    result = run(tools, "generar_link_de_pago", nombre="Ana", telefono="88881234")
 
     assert "cotizar el envío" in result["error"]
-    assert sessions.params is None
-
-
-def test_invalid_email_is_reported_to_model(order):
-    tools = make_tools(order, FakeSessions())
-    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
-    run(tools, "cotizar_envio", codigo_postal="03100")
-
-    assert "email válido" in run(tools, "generar_link_de_pago", nombre="Ana", email="ana@")["error"]
-
-
-def test_stripe_failure_becomes_tool_error(order):
-    tools = make_tools(order, FakeSessions(error=stripe.AuthenticationError("Invalid API Key")))
-    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
-    run(tools, "cotizar_envio", codigo_postal="03100")
-
-    result = run(tools, "generar_link_de_pago", nombre="Ana", email="ana@example.com")
-
-    assert "Stripe rechazó" in result["error"]
     assert order.payment_url is None
 
 
+@pytest.mark.parametrize("phone", ["1234", "22223333", "888812345", "ana@example.com"])
+def test_invalid_phone_is_reported_to_model(order, phone):
+    tools = ready_to_pay(order)
+
+    assert "móvil de Nicaragua" in run(tools, "generar_link_de_pago", nombre="Ana", telefono=phone)["error"]
+    assert order.payment_url is None
+
+
+def test_unknown_department_is_reported_to_model(order):
+    tools = make_tools(order)
+    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
+
+    assert "no es un departamento" in run(tools, "cotizar_envio", departamento="Ometepe")["error"]
+
+
 def test_bad_arguments_and_unknown_tools_do_not_crash(order):
-    tools = make_tools(order, FakeSessions())
+    tools = make_tools(order)
     assert "Argumentos inválidos" in run(tools, "agregar_producto", sku="CAF-001", cantidad="dos")["error"]
     assert "desconocida" in run(tools, "hackear")["error"]
 
 
-def test_postal_code_sent_as_number_keeps_leading_zero(order):
-    tools = make_tools(order, FakeSessions())
-    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
-    assert run(tools, "cotizar_envio", codigo_postal=3100)["envio"]["zona"] == "local (CDMX)"
+def _text(text: str, stop_reason: str = "end_turn"):
+    return SimpleNamespace(stop_reason=stop_reason, content=[TextBlock(type="text", text=text)])
 
 
-def _msg(content="", tool_calls=None):
-    return SimpleNamespace(message=SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls))
-
-
-def _call(name, **arguments):
-    return SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))
+def _tool_calls(*calls: tuple[str, dict]):
+    blocks = [
+        ToolUseBlock(type="tool_use", id=f"toolu_{i}", name=name, input=arguments)
+        for i, (name, arguments) in enumerate(calls)
+    ]
+    return SimpleNamespace(stop_reason="tool_use", content=blocks)
 
 
 class ScriptedClient:
+    """Stands in for anthropic.Anthropic: replays canned responses and records each request."""
+
     def __init__(self, responses):
         self._responses = iter(responses)
+        self.requests: list[dict] = []
+        self.messages = SimpleNamespace(create=self._create)
 
-    def chat(self, *, model, messages, tools, options):
+    def _create(self, **request):
+        self.requests.append({**request, "messages": list(request["messages"])})
         return next(self._responses)
 
 
+def make_agent(order: Order, responses, confirms: bool = True) -> tuple[CoffeeShopAgent, ScriptedClient]:
+    client = ScriptedClient(responses)
+    return CoffeeShopAgent(client, "claude-test", make_tools(order, confirms)), client  # type: ignore[arg-type]
+
+
+def test_tool_errors_are_flagged_for_the_model(order):
+    assert make_tools(order).run("agregar_producto", {"sku": "XXX-1", "cantidad": 1})[1] is True
+    assert make_tools(order).run("ver_pedido", {})[1] is False
+
+
 def test_agent_executes_tool_calls_then_answers(order):
-    client = ScriptedClient(
-        [_msg(tool_calls=[_call("agregar_producto", sku="ACC-001", cantidad=1)]), _msg("Listo, agregué la prensa.")]
+    agent, client = make_agent(
+        order,
+        [_tool_calls(("agregar_producto", {"sku": "ACC-001", "cantidad": 1})), _text("Listo, agregué la prensa.")],
     )
-    agent = CoffeeShopAgent(client, "test-model", make_tools(order, FakeSessions()))
 
     assert agent.reply("quiero una prensa") == "Listo, agregué la prensa."
     assert order.lines["ACC-001"].quantity == 1
-    assert agent.messages[-2]["role"] == "tool"
+    tool_result = client.requests[1]["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["tool_use_id"] == "toolu_0"
+    assert tool_result["is_error"] is False
+
+
+def test_parallel_tool_calls_return_results_in_one_message(order):
+    agent, client = make_agent(
+        order,
+        [
+            _tool_calls(
+                ("agregar_producto", {"sku": "CAF-002", "cantidad": 2}),
+                ("agregar_producto", {"sku": "ACC-001", "cantidad": 1}),
+            ),
+            _text("Agregados."),
+        ],
+    )
+
+    agent.reply("2 molidos y una prensa")
+
+    results = client.requests[1]["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["toolu_0", "toolu_1"]
+    assert {sku: line.quantity for sku, line in order.lines.items()} == {"CAF-002": 2, "ACC-001": 1}
 
 
 def test_agent_stops_runaway_tool_loops(order):
-    loop = [_msg(tool_calls=[_call("ver_pedido")])] * CoffeeShopAgent.MAX_TOOL_ROUNDS
-    agent = CoffeeShopAgent(ScriptedClient(loop), "test-model", make_tools(order, FakeSessions()))
+    loop = [_tool_calls(("ver_pedido", {}))] * CoffeeShopAgent.MAX_TOOL_ROUNDS
+    agent, _client = make_agent(order, loop)
 
     assert "repetir" in agent.reply("hola")
 
 
-def test_agent_runs_tool_calls_written_as_text(order):
-    client = ScriptedClient(
-        [_msg('{"name": "agregar_producto", "arguments": {"sku": "CAF-002", "cantidad": 2}}'), _msg("Agregado.")]
-    )
-    agent = CoffeeShopAgent(client, "test-model", make_tools(order, FakeSessions()))
+def test_refusal_gets_a_polite_reply(order):
+    agent, _client = make_agent(order, [_text("", stop_reason="refusal")])
 
-    assert agent.reply("quiero 2 molidos") == "Agregado."
-    assert order.lines["CAF-002"].quantity == 2
+    assert agent.reply("algo raro") == CoffeeShopAgent.REFUSAL_REPLY
 
 
-def test_parse_text_tool_calls_handles_fences_and_ignores_other_json():
-    content = (
-        "```json\n"
-        '{"name": "buscar_productos", "arguments": {"consulta": "molido"}}\n'
-        '{"name": "borrar_todo", "arguments": {}}\n'
-        "```"
-    )
-    assert parse_text_tool_calls(content) == [("buscar_productos", {"consulta": "molido"})]
-    assert parse_text_tool_calls("Tenemos café {rico} y barato") == []
+def test_request_caches_prompt_and_sends_catalog(order):
+    agent, client = make_agent(order, [_text("Hola")])
+    agent.reply("hola")
+
+    request = client.requests[0]
+    assert request["cache_control"] == {"type": "ephemeral"}
+    assert "CAF-002 | Café Jinotega 250g molido | Tueste medio molido | C$ 147.00 | 25" in request["system"]
 
 
-def test_system_prompt_lists_catalog(order):
-    agent = CoffeeShopAgent(ScriptedClient([]), "test-model", make_tools(order, FakeSessions()))
-    prompt = agent.messages[0]["content"]
-    assert "CAF-002 | Café Chiapas 250g molido | Tueste medio molido | 147.00 | 25" in prompt
+def test_history_keeps_full_assistant_content(order):
+    tool_response = _tool_calls(("ver_pedido", {}))
+    agent, _client = make_agent(order, [tool_response, _text("Tu pedido está vacío.")])
+    agent.reply("¿qué llevo?")
+
+    assert agent.messages[1] == {"role": "assistant", "content": tool_response.content}
 
 
-def test_agent_appends_payment_link_when_model_omits_it(order):
-    tools = make_tools(order, FakeSessions())
+def test_customer_declining_summary_blocks_the_charge(order):
+    tools = ready_to_pay(order, confirms=False)
+
+    result = run(tools, "generar_link_de_pago", nombre="Ana", telefono="88881234")
+
+    assert "no confirmó" in result["error"]
+    assert order.payment_url is None
+
+
+def test_confirmation_is_not_asked_for_an_incomplete_order(order):
+    asked = []
+    tools = OrderTools(order, create_pocket_charge, lambda o: asked.append(o) or True)
     run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
-    run(tools, "cotizar_envio", codigo_postal="03100")
-    client = ScriptedClient(
-        [
-            _msg(tool_calls=[_call("generar_link_de_pago", nombre="Ana", email="ana@example.com")]),
-            _msg("Aquí tienes tu enlace: [Enlace de pago]"),
-        ]
-    )
-    agent = CoffeeShopAgent(client, "test-model", tools)
 
-    assert agent.reply("confirmo").endswith("Link de pago: https://checkout.stripe.com/c/pay/cs_test_123")
-
-
-def test_agent_corrects_invented_payment_link(order):
-    tools = make_tools(order, FakeSessions())
-    run(tools, "agregar_producto", sku="CAF-001", cantidad=1)
-    run(tools, "cotizar_envio", codigo_postal="03100")
-    client = ScriptedClient(
-        [
-            _msg("Gracias Ana, aquí está tu link: [Enlace de pago]"),
-            _msg(tool_calls=[_call("generar_link_de_pago", nombre="Ana", email="ana@example.com")]),
-            _msg("Listo: https://checkout.stripe.com/c/pay/cs_test_123"),
-        ]
-    )
-    agent = CoffeeShopAgent(client, "test-model", tools)
-
-    assert agent.reply("confirmo, Ana, ana@example.com") == "Listo: https://checkout.stripe.com/c/pay/cs_test_123"
-    assert all("[Enlace de pago]" not in str(getattr(m, "content", m)) for m in agent.messages)
+    assert "cotizar el envío" in run(tools, "generar_link_de_pago", nombre="Ana", telefono="88881234")["error"]
+    assert asked == []
