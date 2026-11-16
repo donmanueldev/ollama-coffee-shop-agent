@@ -1,9 +1,9 @@
 import json
 import os
 import sys
-from functools import partial
 from pathlib import Path
 
+import httpx
 import ollama
 
 from coffee_agent.agent import CoffeeShopAgent, OrderTools
@@ -19,7 +19,10 @@ CATALOG_PATH = Path(__file__).resolve().parents[2] / "data" / "catalogo.csv"
 DEFAULT_MODEL = "qwen3:4b-instruct"
 YES_ANSWERS = {"s", "si", "sí", "y", "yes"}
 
-say = partial(print, file=sys.stderr, flush=True)
+
+def say(*values: object, end: str = "\n") -> None:
+    """Write chat output to stderr, keeping stdout for the final order JSON."""
+    print(*values, end=end, file=sys.stderr, flush=True)
 
 
 def ask_customer_to_confirm(order: Order) -> bool:
@@ -38,6 +41,30 @@ def ask_customer_to_confirm(order: Order) -> bool:
         return input().strip().casefold() in YES_ANSWERS
     except EOFError:
         return False
+
+
+class StreamedReply:
+    """Prints the Barista's reply as it streams, opening the "Barista:" line only once text arrives.
+
+    Tools can print in the middle of a turn (the confirmation box), so the prefix waits for real text.
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+
+    def __call__(self, piece: str) -> None:
+        if not self.started:
+            say("Barista: ", end="")
+            self.started = True
+        say(piece, end="")
+
+    def end(self, answer: str = "") -> None:
+        if not self.started and answer:
+            # Replies that didn't come from the model, e.g. the fallback after too many tool calls.
+            say(f"Barista: {answer}", end="")
+            self.started = True
+        if self.started:
+            say("\n")
 
 
 def main() -> None:
@@ -64,18 +91,22 @@ def main() -> None:
                 continue
             if text.casefold() in EXIT_COMMANDS:
                 break
+            reply = StreamedReply()
             try:
-                answer = agent.reply(text)
-            except ConnectionError:
+                answer = agent.reply(text, on_text=reply)
+            # Streaming surfaces a stopped server as httpx.ConnectError rather than ConnectionError.
+            except (ConnectionError, httpx.ConnectError):
+                reply.end()
                 say("[No encuentro Ollama. Ábrelo (o corre `ollama serve`) y repite tu mensaje.]")
                 continue
             except ollama.ResponseError as e:
+                reply.end()
                 if e.status_code == 404:
                     say(f"[El modelo {model} no está descargado. Corre `ollama pull {model}`.]")
                     break
                 say(f"[Ollama respondió con un error: {e.error}. Repite tu mensaje.]")
                 continue
-            say(f"Barista: {answer}\n")
+            reply.end(answer)
     except KeyboardInterrupt:
         say()
     finally:

@@ -11,7 +11,7 @@ import argparse
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -197,14 +197,16 @@ class MeteredClient:
         self.seconds = 0.0
         self.max_prompt_tokens = self.output_tokens = 0
 
-    def chat(self, **request) -> ollama.ChatResponse:
+    def chat(self, **request) -> Iterator[ollama.ChatResponse]:
         started = time.monotonic()
-        response = self._client.chat(**request)
+        for chunk in self._client.chat(**request):
+            if chunk.done:
+                # Token counts arrive only on the final chunk of a streamed response.
+                self.max_prompt_tokens = max(self.max_prompt_tokens, chunk.prompt_eval_count or 0)
+                self.output_tokens += chunk.eval_count or 0
+            yield chunk
         self.seconds += time.monotonic() - started
         self.calls += 1
-        self.max_prompt_tokens = max(self.max_prompt_tokens, response.prompt_eval_count or 0)
-        self.output_tokens += response.eval_count or 0
-        return response
 
 
 @dataclass

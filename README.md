@@ -146,8 +146,9 @@ charged. Replace `create_pocket_charge` in `payments.py` to integrate a real gat
 
 The model only talks and picks tools (`buscar_productos`, `agregar_producto`, `quitar_producto`,
 `ver_pedido`, `cotizar_envio`, `generar_link_de_pago`); every price, stock check, and total is
-computed in Python. The catalog is part of the system prompt, and the context is raised to 16K
-tokens so long chats keep the system prompt.
+computed in Python. The catalog is part of the system prompt, the context is raised to 16K
+tokens so long chats keep the system prompt, and replies stream to the terminal as the model
+writes them.
 
 ## Development checks
 

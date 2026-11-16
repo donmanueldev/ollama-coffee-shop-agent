@@ -1,6 +1,8 @@
 import json
+import re
 from types import SimpleNamespace
 
+import ollama
 import pytest
 
 from coffee_agent import CATALOG_PATH
@@ -88,17 +90,25 @@ def test_bad_arguments_and_unknown_tools_do_not_crash(order):
     assert "desconocida" in run(tools, "hackear")["error"]
 
 
-def _text(content: str):
-    return SimpleNamespace(message=SimpleNamespace(role="assistant", content=content, tool_calls=None))
+def _chunk(content: str = "", tool_calls=None):
+    return SimpleNamespace(message=SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls))
 
 
-def _tool_calls(*calls: tuple[str, dict]):
-    tool_calls = [SimpleNamespace(function=SimpleNamespace(name=name, arguments=args)) for name, args in calls]
-    return SimpleNamespace(message=SimpleNamespace(role="assistant", content="", tool_calls=tool_calls))
+def _text(content: str) -> list:
+    """A text reply streamed word by word, like Ollama does, ending with an empty final chunk."""
+    return [_chunk(piece) for piece in re.findall(r"\S+\s*", content)] + [_chunk()]
+
+
+def _tool_calls(*calls: tuple[str, dict]) -> list:
+    tool_calls = [
+        ollama.Message.ToolCall(function=ollama.Message.ToolCall.Function(name=name, arguments=args))
+        for name, args in calls
+    ]
+    return [_chunk(tool_calls=tool_calls), _chunk()]
 
 
 class ScriptedClient:
-    """Stands in for ollama.Client: replays canned responses and records each request."""
+    """Stands in for ollama.Client: replays canned streamed responses and records each request."""
 
     def __init__(self, responses):
         self._responses = iter(responses)
@@ -106,7 +116,7 @@ class ScriptedClient:
 
     def chat(self, **request):
         self.requests.append({**request, "messages": list(request["messages"])})
-        return next(self._responses)
+        return iter(next(self._responses))
 
 
 def make_agent(order: Order, responses, confirms: bool = True) -> tuple[CoffeeShopAgent, ScriptedClient]:
@@ -190,3 +200,28 @@ def test_confirmation_is_not_asked_for_an_incomplete_order(order):
 
     assert "cotizar el envío" in run(tools, "generar_link_de_pago", nombre="Ana", telefono="88881234")["error"]
     assert asked == []
+
+
+def test_reply_streams_text_as_it_arrives(order):
+    agent, client = make_agent(order, [_text("Tenemos café de Jinotega.")])
+    pieces: list[str] = []
+
+    answer = agent.reply("¿qué tienen?", on_text=pieces.append)
+
+    assert pieces == ["Tenemos ", "café ", "de ", "Jinotega."]
+    assert answer == "Tenemos café de Jinotega."
+    assert client.requests[0]["stream"] is True
+
+
+def test_streamed_reply_is_stored_as_one_message(order):
+    agent, _client = make_agent(
+        order, [_tool_calls(("agregar_producto", {"sku": "ACC-001", "cantidad": 1})), _text("Listo, agregada.")]
+    )
+    pieces: list[str] = []
+
+    agent.reply("una prensa", on_text=pieces.append)
+
+    assert pieces == ["Listo, ", "agregada."]
+    assistant_messages = [m for m in agent.messages if getattr(m, "role", None) == "assistant"]
+    assert [m.content for m in assistant_messages] == ["", "Listo, agregada."]
+    assert assistant_messages[0].tool_calls[0].function.name == "agregar_producto"

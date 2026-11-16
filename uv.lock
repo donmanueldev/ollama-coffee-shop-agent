@@ -38,6 +38,7 @@ name = "coffee-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "ollama" },
     { name = "stdnum-centroamerica" },
 ]
@@ -51,6 +52,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "ollama", specifier = ">=0.6.3" },
     { name = "stdnum-centroamerica", specifier = ">=0.2.0" },
 ]

@@ -201,16 +201,11 @@ class CoffeeShopAgent:
         self._tools = tools
         self.messages: list = [{"role": "system", "content": build_system_prompt(tools.order.catalog)}]
 
-    def reply(self, user_text: str) -> str:
+    def reply(self, user_text: str, on_text: Callable[[str], None] = lambda _piece: None) -> str:
+        """Answer one customer message, passing each piece of text to `on_text` as the model writes it."""
         self.messages.append({"role": "user", "content": user_text})
         for _ in range(self.MAX_TOOL_ROUNDS):
-            response = self._client.chat(
-                model=self._model,
-                messages=self.messages,
-                tools=TOOLS,
-                options=self.OPTIONS,
-            )
-            message = response.message
+            message = self._stream_message(on_text)
             self.messages.append(message)
             if not message.tool_calls:
                 return message.content or ""
@@ -220,3 +215,16 @@ class CoffeeShopAgent:
                     {"role": "tool", "tool_name": call.function.name, "content": json.dumps(result, ensure_ascii=False)}
                 )
         return "Perdón, me enredé con tu solicitud. ¿Me la puedes repetir con otras palabras?"
+
+    def _stream_message(self, on_text: Callable[[str], None]) -> ollama.Message:
+        """Stream one model response and rebuild it as a single message for the history."""
+        content: list[str] = []
+        tool_calls: list[ollama.Message.ToolCall] = []
+        for chunk in self._client.chat(
+            model=self._model, messages=self.messages, tools=TOOLS, options=self.OPTIONS, stream=True
+        ):
+            if chunk.message.content:
+                content.append(chunk.message.content)
+                on_text(chunk.message.content)
+            tool_calls.extend(chunk.message.tool_calls or [])
+        return ollama.Message(role="assistant", content="".join(content), tool_calls=tool_calls or None)
