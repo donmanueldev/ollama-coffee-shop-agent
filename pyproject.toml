@@ -1,0 +1,31 @@
+[project]
+name = "coffee-agent"
+version = "0.1.0"
+description = "Terminal chat sales agent for an online coffee shop, powered by a local Ollama model and Stripe Checkout"
+authors = [
+    { name = "manuelduarte077", email = "carlosd99m@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "ollama>=0.6.3",
+    "stripe>=17.0.0",
+]
+
+[project.scripts]
+coffee-agent = "coffee_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
