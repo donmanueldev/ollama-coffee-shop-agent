@@ -219,3 +219,6 @@ __marimo__/
 
 # Session data
 sessions/
+
+# Order output saved with `uv run coffee-agent > pedido.json`
+pedido.json
