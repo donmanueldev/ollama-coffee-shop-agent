@@ -98,7 +98,8 @@ Prompt changes on small models often have side effects you only see by measuring
 
 Say you want the Barista to answer the shop's opening hours. Four steps:
 
-**1. Describe the tool for the model** by adding an entry to `TOOLS` in `agent.py`:
+**1. Describe the tool for the model** by adding this entry to the `TOOLS` list in `agent.py`
+(followed by a comma, like the others):
 
 ```python
 {
@@ -108,7 +109,7 @@ Say you want the Barista to answer the shop's opening hours. Four steps:
         "description": "Devuelve el horario de atención de la tienda.",
         "parameters": {"type": "object", "properties": {}},
     },
-},
+}
 ```
 
 The description matters: it's how the model decides when to use the tool.

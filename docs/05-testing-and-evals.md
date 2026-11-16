@@ -96,8 +96,8 @@ away, and in long chats it sometimes drops the second of two products requested 
 
 ### Add an eval scenario
 
-Scenarios are in `SCENARIOS` in `evals/run_evals.py`. Each has a name, the customer's messages,
-and checks on the final order:
+Scenarios are in the `SCENARIOS` list in `evals/run_evals.py`. Each has a name, the customer's
+messages, and checks on the final order. Add yours to the list (followed by a comma):
 
 ```python
 Scenario(
@@ -109,7 +109,7 @@ Scenario(
         "Luis Ruiz, 7777 1234",
     ],
     [lines_are({"ACC-001": 1}), shipping_is("Granada", "150"), paid(True)],
-),
+)
 ```
 
 Available checks:
