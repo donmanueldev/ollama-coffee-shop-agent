@@ -14,8 +14,9 @@ from coffee_agent.text import cordobas
 
 EXIT_COMMANDS = {"salir", "exit", "quit", "adios", "adiós"}
 CATALOG_PATH = Path(__file__).resolve().parents[2] / "data" / "catalogo.csv"
-# Light enough for a laptop and passes the evals (see evals/); override with OLLAMA_MODEL.
-DEFAULT_MODEL = "qwen3:4b"
+# Answers without a reasoning step: 85% of the evals in ~15 s per conversation. The reasoning
+# variant (qwen3:4b) passed them all but took minutes per conversation. Override with OLLAMA_MODEL.
+DEFAULT_MODEL = "qwen3:4b-instruct"
 YES_ANSWERS = {"s", "si", "sí", "y", "yes"}
 
 say = partial(print, file=sys.stderr, flush=True)

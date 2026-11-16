@@ -18,7 +18,7 @@ Everything runs on your machine: no API keys, no cost, no internet needed.
 Download the model once:
 
 ```bash
-ollama pull qwen3:4b
+ollama pull qwen3:4b-instruct
 ```
 
 Python dependencies install on the first `uv run`.
@@ -95,12 +95,26 @@ uv run coffee-agent > pedido.json
 
 ### Another model
 
+The default `qwen3:4b-instruct` answers directly. Its sibling `qwen3:4b` reasons before every
+reply: more accurate, much slower. Measured with the evals on an M3 Pro:
+
+| Model | Evals passed | Time per conversation |
+|-------|--------------|-----------------------|
+| `qwen3:4b-instruct` (default) | 28/33 (85%) | 1–50 s |
+| `qwen3:4b` | 11/11 (1 run) | 38 s – 5 min |
+
+The instruct model's misses: it sometimes asks "¿deseas agregarlo?" instead of adding a product
+right away, and in long chats it can drop the second of two products requested together (the
+confirmation box shows the order before charging, so the customer can catch it).
+
+To use another model:
+
 ```bash
-ollama pull llama3.2:3b
-OLLAMA_MODEL=llama3.2:3b uv run coffee-agent
+ollama pull qwen3:4b
+OLLAMA_MODEL=qwen3:4b uv run coffee-agent
 ```
 
-The model must support tool calling. Run the evals (below) before relying on a new one.
+It must support tool calling. Run the evals (below) before relying on a new one.
 
 ### Troubleshooting
 
