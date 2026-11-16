@@ -2,8 +2,7 @@ import json
 import re
 from collections.abc import Callable
 
-import anthropic
-from anthropic.types import MessageParam, TextBlock, ToolParam, ToolResultBlockParam, ToolUseBlock
+import ollama
 
 from coffee_agent.catalog import Catalog
 from coffee_agent.order import Order, OrderError
@@ -16,9 +15,10 @@ español, con un tono cálido y breve. La moneda es el córdoba nicaragüense; e
 como C$ 147.00.
 
 Los precios, el stock, el envío y el cobro los calcula el sistema a través de tus herramientas: \
-usa sus resultados y no estimes montos por tu cuenta. Agrega o quita productos con su SKU en \
-cuanto el cliente lo pida. Si una herramienta devuelve un error, explícale al cliente qué pasó y \
-ofrécele una alternativa.
+usa sus resultados y no estimes montos por tu cuenta. Cuando el cliente dice que quiere un \
+producto ("quiero", "dame", "agrégame"), agrégalo de inmediato con agregar_producto, sin preguntar \
+si lo agregas: el sistema le pide confirmar el pedido completo antes de cobrar. Si una herramienta \
+devuelve un error, explícale al cliente qué pasó y ofrécele una alternativa.
 
 Para cerrar la venta:
 1. Pregunta a qué departamento se envía y cotiza el envío (es gratis desde C$ 1,600 de \
@@ -32,62 +32,80 @@ Catálogo (SKU | producto | descripción | precio | stock):
 {catalog}
 """
 
-TOOLS: list[ToolParam] = [
+TOOLS: list[dict] = [
     {
-        "name": "buscar_productos",
-        "description": "Busca en el catálogo por palabras (nombre, descripción o SKU). "
-        "Sin consulta devuelve el catálogo completo.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"consulta": {"type": "string", "description": "Ej. 'molido', 'prensa', 'Jinotega'"}},
-        },
-    },
-    {
-        "name": "agregar_producto",
-        "description": "Agrega unidades de un producto al pedido.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sku": {"type": "string", "description": "SKU del producto, ej. CAF-001"},
-                "cantidad": {"type": "integer", "description": "Unidades a agregar"},
+        "type": "function",
+        "function": {
+            "name": "buscar_productos",
+            "description": "Busca en el catálogo por palabras (nombre, descripción o SKU). "
+            "Sin consulta devuelve el catálogo completo.",
+            "parameters": {
+                "type": "object",
+                "properties": {"consulta": {"type": "string", "description": "Ej. 'molido', 'prensa', 'Jinotega'"}},
             },
-            "required": ["sku", "cantidad"],
         },
     },
     {
-        "name": "quitar_producto",
-        "description": "Quita unidades de un producto del pedido. Sin cantidad quita la línea completa.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"sku": {"type": "string"}, "cantidad": {"type": "integer"}},
-            "required": ["sku"],
-        },
-    },
-    {
-        "name": "ver_pedido",
-        "description": "Devuelve el pedido actual con subtotal, envío y total.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "cotizar_envio",
-        "description": "Cotiza el envío del pedido actual a un departamento de Nicaragua.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"departamento": {"type": "string", "description": ", ".join(departments())}},
-            "required": ["departamento"],
-        },
-    },
-    {
-        "name": "generar_link_de_pago",
-        "description": "Cierra la venta con un cobro Pocket. Antes de cobrar, el sistema le pide al cliente "
-        "que confirme el resumen; devuelve el link de pago o el motivo por el que no se generó.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "nombre": {"type": "string", "description": "Nombre del cliente"},
-                "telefono": {"type": "string", "description": "Teléfono de su cuenta Pocket, 8 dígitos"},
+        "type": "function",
+        "function": {
+            "name": "agregar_producto",
+            "description": "Agrega unidades de un producto al pedido.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "SKU del producto, ej. CAF-001"},
+                    "cantidad": {"type": "integer", "description": "Unidades a agregar"},
+                },
+                "required": ["sku", "cantidad"],
             },
-            "required": ["nombre", "telefono"],
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "quitar_producto",
+            "description": "Quita unidades de un producto del pedido. Sin cantidad quita la línea completa.",
+            "parameters": {
+                "type": "object",
+                "properties": {"sku": {"type": "string"}, "cantidad": {"type": "integer"}},
+                "required": ["sku"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ver_pedido",
+            "description": "Devuelve el pedido actual con subtotal, envío y total.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cotizar_envio",
+            "description": "Cotiza el envío del pedido actual a un departamento de Nicaragua.",
+            "parameters": {
+                "type": "object",
+                "properties": {"departamento": {"type": "string", "description": ", ".join(departments())}},
+                "required": ["departamento"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generar_link_de_pago",
+            "description": "Cierra la venta con un cobro Pocket. Antes de cobrar, el sistema le pide al cliente "
+            "que confirme el resumen; devuelve el link de pago o el motivo por el que no se generó.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nombre": {"type": "string", "description": "Nombre del cliente"},
+                    "telefono": {"type": "string", "description": "Teléfono de su cuenta Pocket, 8 dígitos"},
+                },
+                "required": ["nombre", "telefono"],
+            },
         },
     },
 ]
@@ -97,7 +115,7 @@ _PHONE = re.compile(r"(?:505)?([578]\d{7})")
 
 
 def build_system_prompt(catalog: Catalog) -> str:
-    # The catalog is small and stable, so it rides in the cached prompt instead of costing a tool call.
+    # The catalog is small, so the model sees it up front instead of spending a tool call on it.
     listing = "\n".join(
         f"- {p.sku} | {p.name} | {p.description} | {cordobas(p.price_nio)} | {p.stock}" for p in catalog.all()
     )
@@ -118,17 +136,17 @@ class OrderTools:
         # The customer confirms through the app, not through the model, so a misread "sí" can't charge.
         self._customer_confirms = customer_confirms
 
-    def run(self, name: str, arguments: dict) -> tuple[dict, bool]:
-        """Return the tool's result and whether it is an error the model should explain."""
+    def run(self, name: str, arguments: dict) -> dict:
+        """Return the tool's result, or {"error": ...} for the model to explain to the customer."""
         handler = getattr(self, f"_tool_{name}", None)
         if handler is None:
-            return {"error": f"Herramienta desconocida: {name}"}, True
+            return {"error": f"Herramienta desconocida: {name}"}
         try:
-            return handler(**arguments), False
+            return handler(**arguments)
         except (OrderError, InvalidDepartment) as e:
-            return {"error": str(e)}, True
+            return {"error": str(e)}
         except (TypeError, ValueError):
-            return {"error": f"Argumentos inválidos para {name}: {arguments}"}, True
+            return {"error": f"Argumentos inválidos para {name}: {arguments}"}
 
     def _tool_buscar_productos(self, consulta: str = "") -> dict:
         products = self.order.catalog.search(consulta)
@@ -174,50 +192,32 @@ class OrderTools:
 class CoffeeShopAgent:
     # A runaway sequence of tool calls should end the turn, not spin forever.
     MAX_TOOL_ROUNDS = 8
-    # Chat replies with short tool hops; low effort keeps latency and cost down. Re-check with the evals.
-    EFFORT = "low"
-    REFUSAL_REPLY = "Perdón, no puedo ayudarte con eso. ¿Te ayudo con tu pedido de café?"
+    # Ollama's default 4096-token context silently drops the oldest messages (system prompt and catalog
+    # included) once a chat outgrows it, so reserve room for a long conversation.
+    OPTIONS = {"num_ctx": 16384}
 
-    def __init__(self, client: anthropic.Anthropic, model: str, tools: OrderTools):
+    def __init__(self, client: ollama.Client, model: str, tools: OrderTools):
         self._client = client
         self._model = model
         self._tools = tools
-        self._system = build_system_prompt(tools.order.catalog)
-        self.messages: list[MessageParam] = []
+        self.messages: list = [{"role": "system", "content": build_system_prompt(tools.order.catalog)}]
 
     def reply(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         for _ in range(self.MAX_TOOL_ROUNDS):
-            response = self._client.messages.create(
+            response = self._client.chat(
                 model=self._model,
-                max_tokens=16000,
-                system=self._system,
-                tools=TOOLS,
                 messages=self.messages,
-                output_config={"effort": self.EFFORT},
-                # Caches tools + system + history up to the last block, so each turn pays only for what's new.
-                cache_control={"type": "ephemeral"},
+                tools=TOOLS,
+                options=self.OPTIONS,
             )
-            # Keep the full content (thinking and tool_use blocks included); the API expects it back as is.
-            self.messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "refusal":
-                return self.REFUSAL_REPLY
-            if response.stop_reason != "tool_use":
-                return "".join(block.text for block in response.content if isinstance(block, TextBlock))
-            self.messages.append({"role": "user", "content": self._run_tools(response.content)})
-        return "Perdón, me enredé con tu solicitud. ¿Me la puedes repetir con otras palabras?"
-
-    def _run_tools(self, content: list) -> list[ToolResultBlockParam]:
-        results: list[ToolResultBlockParam] = []
-        for block in content:
-            if isinstance(block, ToolUseBlock):
-                result, is_error = self._tools.run(block.name, dict(block.input))
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(result, ensure_ascii=False),
-                        "is_error": is_error,
-                    }
+            message = response.message
+            self.messages.append(message)
+            if not message.tool_calls:
+                return message.content or ""
+            for call in message.tool_calls:
+                result = self._tools.run(call.function.name, dict(call.function.arguments or {}))
+                self.messages.append(
+                    {"role": "tool", "tool_name": call.function.name, "content": json.dumps(result, ensure_ascii=False)}
                 )
-        return results
+        return "Perdón, me enredé con tu solicitud. ¿Me la puedes repetir con otras palabras?"

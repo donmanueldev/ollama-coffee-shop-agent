@@ -1,14 +1,12 @@
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
+from coffee_agent import CATALOG_PATH
 from coffee_agent.catalog import Catalog
 from coffee_agent.order import Order, OrderError
 from coffee_agent.shipping import InvalidDepartment, departments, quote_shipping
 from coffee_agent.text import cordobas
-
-CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "catalogo.csv"
 
 
 @pytest.fixture

@@ -1,7 +1,7 @@
-"""Run scripted customer conversations against the real Claude model and grade the resulting order.
+"""Run scripted customer conversations against the local Ollama model and grade the resulting order.
 
-Unit tests prove the code; these evals measure how reliably the model drives it. Each run calls
-the Anthropic API and is billed; the token totals printed per scenario show where the spend goes.
+Unit tests prove the code; these evals measure how reliably the model drives it. Ollama must be
+running with the model pulled.
 
     uv run python evals/run_evals.py                 # every scenario once
     uv run python evals/run_evals.py --runs 3 happy  # scenarios whose name contains "happy"
@@ -14,19 +14,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from pathlib import Path
-from types import SimpleNamespace
 
-import anthropic
-from anthropic.types import Message
+import ollama
 
-from coffee_agent import DEFAULT_MODEL
+from coffee_agent import CATALOG_PATH, DEFAULT_MODEL
 from coffee_agent.agent import CoffeeShopAgent, OrderTools
 from coffee_agent.catalog import Catalog
 from coffee_agent.order import Order
 from coffee_agent.payments import create_pocket_charge
-
-CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "catalogo.csv"
 
 # A check returns a failure reason, or None when the conversation met expectations.
 Check = Callable[[Order, list[str]], str | None]
@@ -82,6 +77,12 @@ def last_answer_has_link(order: Order, answers: list[str]) -> str | None:
 
 
 _AMOUNT_WITHOUT_CORDOBAS = re.compile(r"(?<!C)\$")
+
+
+def no_leaked_reasoning(_order: Order, answers: list[str]) -> str | None:
+    if any("<think>" in answer or "</think>" in answer for answer in answers):
+        return "la respuesta incluye el razonamiento interno del modelo"
+    return None
 
 
 def amounts_in_cordobas(_order: Order, answers: list[str]) -> str | None:
@@ -188,24 +189,21 @@ SCENARIOS = [
 
 
 class MeteredClient:
-    """Wraps anthropic.Anthropic to record tokens and latency per call, for the cost and time budget."""
+    """Wraps ollama.Client to record tokens and latency per call, to watch context size and speed."""
 
-    def __init__(self, client: anthropic.Anthropic):
+    def __init__(self, client: ollama.Client):
         self._client = client
         self.calls = 0
         self.seconds = 0.0
-        self.input_tokens = self.cached_tokens = self.output_tokens = 0
-        self.messages = SimpleNamespace(create=self._create)
+        self.max_prompt_tokens = self.output_tokens = 0
 
-    def _create(self, **request) -> Message:
+    def chat(self, **request) -> ollama.ChatResponse:
         started = time.monotonic()
-        response = self._client.messages.create(**request)
+        response = self._client.chat(**request)
         self.seconds += time.monotonic() - started
         self.calls += 1
-        usage = response.usage
-        self.cached_tokens += usage.cache_read_input_tokens or 0
-        self.input_tokens += usage.input_tokens + (usage.cache_creation_input_tokens or 0)
-        self.output_tokens += usage.output_tokens
+        self.max_prompt_tokens = max(self.max_prompt_tokens, response.prompt_eval_count or 0)
+        self.output_tokens += response.eval_count or 0
         return response
 
 
@@ -216,14 +214,14 @@ class Result:
     meter: MeteredClient
 
 
-def run_scenario(scenario: Scenario, client: anthropic.Anthropic, model: str) -> Result:
+def run_scenario(scenario: Scenario, client: ollama.Client, model: str) -> Result:
     order = Order(Catalog.from_csv(CATALOG_PATH))
     metered = MeteredClient(client)
     confirmations = iter(scenario.confirmations)
     tools = OrderTools(order, create_pocket_charge, lambda _order: next(confirmations, True))
     agent = CoffeeShopAgent(metered, model, tools)  # type: ignore[arg-type]
     answers = [agent.reply(turn) for turn in scenario.turns]
-    checks = [*scenario.checks, amounts_in_cordobas]
+    checks = [*scenario.checks, amounts_in_cordobas, no_leaked_reasoning]
     failures = [reason for check in checks if (reason := check(order, answers))]
     return Result(scenario.name, failures, metered)
 
@@ -234,31 +232,28 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=1)
     args = parser.parse_args()
 
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    client = anthropic.Anthropic()
+    model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
+    client = ollama.Client()
     scenarios = [s for s in SCENARIOS if args.filter in s.name]
     print(f"Modelo {model} · {len(scenarios)} escenarios × {args.runs} corridas\n")
 
-    passed = total = input_tokens = cached_tokens = output_tokens = 0
+    passed = total = 0
+    seconds = 0.0
     for scenario in scenarios:
         for _ in range(args.runs):
             result = run_scenario(scenario, client, model)
             total += 1
             passed += not result.failures
             meter = result.meter
-            input_tokens += meter.input_tokens
-            cached_tokens += meter.cached_tokens
-            output_tokens += meter.output_tokens
+            seconds += meter.seconds
             status = "PASS" if not result.failures else "FAIL"
             print(
                 f"{status} {result.scenario:<30} {meter.seconds:6.1f}s  {meter.calls:2d} llamadas"
-                f"  tokens: {meter.input_tokens:6d} entrada · {meter.cached_tokens:6d} caché"
-                f" · {meter.output_tokens:5d} salida"
+                f"  máx {meter.max_prompt_tokens:5d} tokens de prompt · {meter.output_tokens:5d} de salida"
             )
             for reason in result.failures:
                 print(f"     - {reason}")
-    print(f"\n{passed}/{total} pasaron ({passed / total:.0%})")
-    print(f"Tokens totales: {input_tokens} entrada · {cached_tokens} leídos de caché · {output_tokens} salida")
+    print(f"\n{passed}/{total} pasaron ({passed / total:.0%}) en {seconds / 60:.1f} min")
 
 
 if __name__ == "__main__":

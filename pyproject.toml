@@ -1,13 +1,14 @@
 [project]
 name = "coffee-agent"
 version = "0.1.0"
-description = "Terminal chat sales agent for an online coffee shop, powered by Claude with simulated Pocket payments"
+description = "Terminal chat sales agent for an online coffee shop, powered by a local Ollama model with simulated Pocket payments"
 authors = [
     { name = "donmanueldev", email = "donmanueldev@gmail.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "anthropic>=2.8.0",
+    "ollama>=0.6.3",
+    "stdnum-centroamerica>=0.2.0",
 ]
 
 [project.scripts]

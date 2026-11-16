@@ -4,7 +4,7 @@ import sys
 from functools import partial
 from pathlib import Path
 
-import anthropic
+import ollama
 
 from coffee_agent.agent import CoffeeShopAgent, OrderTools
 from coffee_agent.catalog import Catalog
@@ -13,9 +13,9 @@ from coffee_agent.payments import create_pocket_charge
 from coffee_agent.text import cordobas
 
 EXIT_COMMANDS = {"salir", "exit", "quit", "adios", "adiós"}
-DEFAULT_CATALOG = Path(__file__).resolve().parents[2] / "data" / "catalogo.csv"
-# Cheapest Claude tier; enough for a short sales chat with a handful of tools (see evals/).
-DEFAULT_MODEL = "claude-haiku-5-5"
+CATALOG_PATH = Path(__file__).resolve().parents[2] / "data" / "catalogo.csv"
+# Light enough for a laptop and passes the evals (see evals/); override with OLLAMA_MODEL.
+DEFAULT_MODEL = "qwen3:4b"
 YES_ANSWERS = {"s", "si", "sí", "y", "yes"}
 
 say = partial(print, file=sys.stderr, flush=True)
@@ -40,17 +40,11 @@ def ask_customer_to_confirm(order: Order) -> bool:
 
 
 def main() -> None:
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    catalog = Catalog.from_csv(Path(os.environ.get("CATALOG_PATH", DEFAULT_CATALOG)))
-    # Resolves ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile.
-    client = anthropic.Anthropic()
-    if client.api_key is None and client.auth_token is None and client.credentials is None:
-        say("Falta la clave de Anthropic. Ponla en .env (ANTHROPIC_API_KEY=...) y corre:")
-        say("  uv run --env-file .env coffee-agent")
-        sys.exit(1)
-    order = Order(catalog)
+    model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
+    order = Order(Catalog.from_csv(CATALOG_PATH))
     agent = CoffeeShopAgent(
-        client=client,
+        # Talks to the local Ollama server (http://localhost:11434, or OLLAMA_HOST if set).
+        client=ollama.Client(),
         model=model,
         tools=OrderTools(order, create_pocket_charge, ask_customer_to_confirm),
     )
@@ -71,17 +65,14 @@ def main() -> None:
                 break
             try:
                 answer = agent.reply(text)
-            except anthropic.AuthenticationError:
-                say("[La API de Anthropic rechazó la clave. Revisa ANTHROPIC_API_KEY.]")
-                break
-            except anthropic.RateLimitError:
-                say("[Límite de uso de la API alcanzado. Espera un momento y repite tu mensaje.]")
+            except ConnectionError:
+                say("[No encuentro Ollama. Ábrelo (o corre `ollama serve`) y repite tu mensaje.]")
                 continue
-            except anthropic.APIStatusError as e:
-                say(f"[La API de Anthropic respondió con un error ({e.status_code}). Repite tu mensaje.]")
-                continue
-            except anthropic.APIConnectionError:
-                say("[No hay conexión con la API de Anthropic. Revisa tu internet y repite tu mensaje.]")
+            except ollama.ResponseError as e:
+                if e.status_code == 404:
+                    say(f"[El modelo {model} no está descargado. Corre `ollama pull {model}`.]")
+                    break
+                say(f"[Ollama respondió con un error: {e.error}. Repite tu mensaje.]")
                 continue
             say(f"Barista: {answer}\n")
     except KeyboardInterrupt:
